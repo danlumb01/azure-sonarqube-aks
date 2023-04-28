@@ -1,0 +1,254 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgsql-init
+  namespace: sonar
+
+data:
+  # file-like keys
+  sonar_db_init.sh: |
+    #!/bin/bash
+
+    psql --username postgres << EOF
+      CREATE USER sonarqube WITH PASSWORD '${POSTGRES_SONAR_PASSWORD}';
+      CREATE DATABASE sonarqube;
+      GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonarqube;
+    EOF
+
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgsql-data
+  namespace: sonar
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: default
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+      
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonar-pgsql
+  namespace: sonar
+spec:
+  selector:
+    matchLabels:
+      app: sonar-pgsql
+      tier: db
+  replicas: 1 
+  template:
+    metadata:
+      name: sonar-pgsql
+      labels:
+        app: sonar-pgsql
+        tier: db
+    spec:
+      containers:
+      - name: pgsql
+        image: postgres:13.1
+        
+        env:
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sonar-postgres-secrets
+              key: postgres-root-password
+
+        - name: POSTGRES_SONAR_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sonar-postgres-secrets
+              key: postgres-sonar-password
+        
+        volumeMounts:
+        - mountPath: "/var/lib/postgresql/data/"
+          name: dbdata
+
+        - mountPath: /docker-entrypoint-initdb.d
+          name: initdb
+          readOnly: true
+      
+      volumes:
+      - name: dbdata
+        persistentVolumeClaim:
+          claimName: pgsql-data
+
+      - name: initdb
+        configMap:
+          name: pgsql-init
+          defaultMode: 0777
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonar-pgsql-service
+  namespace: sonar
+  labels:
+    run: sonar-pgsql
+spec:
+  selector:
+    app: sonar-pgsql
+  ports:
+  - port: 5432
+    protocol: TCP
+  type: ClusterIP
+
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonar-data
+  namespace: sonar
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: default
+  resources:
+    requests:
+      storage: 31Gi
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonar-extensions
+  namespace: sonar
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: default
+  resources:
+    requests:
+      storage: 31Gi
+
+---
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: sonar-web
+    namespace: sonar
+spec:
+  selector:
+    matchLabels:
+      app: sonar-web
+      tier: web
+  replicas: 1
+  template:
+    metadata:
+      name: sonar-web
+      labels:
+        app: sonar-web
+        tier: web
+    spec:
+      containers:
+        - name: sonarqube
+          image: sonarqube:8.6-community
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1024Mi
+            limits:
+              cpu: 2000m
+              memory: 2048Mi
+          volumeMounts:
+          - mountPath: "/opt/sonarqube/data/"
+            name: sonar-data
+          - mountPath: "/opt/sonarqube/extensions/"
+            name: sonar-extensions
+          env:
+          - name: "SONARQUBE_JDBC_USERNAME"
+            value: "sonarqube"
+
+          - name: "SONARQUBE_JDBC_URL"
+            value: "jdbc:postgresql://sonar-pgsql-service.sonar:5432/sonarqube"
+
+          - name: "SONARQUBE_JDBC_PASSWORD"
+            valueFrom:
+              secretKeyRef:
+                name: sonar-postgres-secrets
+                key: postgres-sonar-password
+          ports:
+          - containerPort: 9000
+            protocol: TCP
+      
+      initContainers:
+      - name: sonarqube-init
+        image: busybox:latest
+        command: ['sh', '-c', 'sysctl -w vm.max_map_count=262144']
+        securityContext:
+          privileged: true
+      
+      volumes:
+      - name: sonar-data
+        persistentVolumeClaim:
+          claimName: sonar-data
+
+      - name: sonar-extensions
+        persistentVolumeClaim:
+          claimName: sonar-extensions
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonar-web-service
+  namespace: sonar
+  annotations: 
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: subnet-app-dev-001
+  labels:
+    run: sonar-web
+spec:
+  selector:
+    app: sonar-web
+  type: LoadBalancer
+  loadBalancerIP: 10.0.10.60 # dev app subnet
+  ports:
+  - port: 9000
+    protocol: TCP
+  
+---
+
+# With TLS
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: sonar-web-ingress
+  namespace: sonar
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+spec:
+  tls:
+  - hosts:
+    - sonar.example.dev
+    secretName: sonar-ingress-tls
+  rules:
+  - http:
+      paths:
+      - backend:
+          serviceName: sonar-web-service
+          servicePort: 9000
+        path: /(.*)
